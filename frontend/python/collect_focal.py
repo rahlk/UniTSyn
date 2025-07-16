@@ -19,7 +19,7 @@ from frontend.python.collect_focal_org import (
     parse_func_name,
     is_subpath,
     jedi2ast,
-    collect_from_repo,
+    collect_from_repo_with_timeout as collect_from_repo,
 )
 
 

@@ -6,24 +6,27 @@ https://docs.pytest.org/en/7.4.x/explanation/goodpractices.html#test-discovery
 
 import os
 import re
-import sys
 import ast
 import fire
-import traceback
-from tqdm import tqdm
+import shutil
+import tarfile
+import tempfile
 from pathlib import Path
 from collections import Counter
-from typing import List, Optional
+from typing import List
 
 from frontend.util import run_with_timeout, wrap_repo, mp_map_repos, TimeoutException
 from navigate import ModuleNavigator, dump_ast_func
+from scripts.download_repos import download_repo
+from scripts.common import get_access_token
+from github import Github, Auth
 
 
 def collect_test_files(root: str):
     """collect all files in the root folder recursively and filter to match the given patterns"""
     patterns = [
-        ".*_test\.py",  # pylint: disable=anomalous-backslash-in-string
-        "test_.*\.py",  # pylint: disable=anomalous-backslash-in-string
+        r".*_test\.py",
+        r"test_.*\.py",
     ]
     test_files = []
     for parent, _, files in os.walk(root):
@@ -70,12 +73,22 @@ def collect_test_funcs(module_path: str):
         # builtin assertion
         if len(nav.find_all(ast.Assert, root=func)) > 0:
             return True
-        # Testcase in unittest, eg. self.assertEqual
+        # Check for various assertion patterns
         for call in nav.find_all(ast.Call, root=func):
-            if isinstance(call.func, ast.Attribute) and call.func.attr.startswith(
-                "assert"
-            ):
-                return True
+            if isinstance(call.func, ast.Attribute):
+                # unittest style: self.assertEqual, self.assertTrue, etc.
+                if call.func.attr.startswith("assert"):
+                    return True
+            elif isinstance(call.func, ast.Name):
+                # nose style: assert_equal, assert_true, etc.
+                # pytest style: pytest.raises, etc.
+                # other direct assertion function calls
+                if call.func.id.startswith("assert") or call.func.id in [
+                    "raises",
+                    "fail",
+                    "ok_",
+                ]:
+                    return True
         return False
 
     def is_test_outside_cls(func: ast.AST):
@@ -119,44 +132,133 @@ def collect_test_funcs(module_path: str):
 
 
 @run_with_timeout
-def collect_from_repo(repo_id: str, repo_root: str, test_root: str):
+def collect_from_repo(
+    repo_id: str, repo_root: str, test_root: str, auto_download: bool = True
+):
     """collect all test functions in the given project
     return (status, nfile, ntest)
-    status can be 0: success, 1: repo not found, 2: test not found, 3: skip when output file existed
+    status can be 0: success, 1: repo not found, 2: test not found, 3: skip when output file existed,
+           4: download failed, 5: extract failed
     """
-    repo_path = os.path.join(repo_root, wrap_repo(repo_id))
-    if not os.path.exists(repo_path) or not os.path.isdir(repo_path):
-        return 1, 0, 0
     test_path = os.path.join(test_root, wrap_repo(repo_id) + ".txt")
     # skip if exist
     if os.path.exists(test_path):
         return 3, 0, 0
-    # collect potential testing modules
-    all_files = collect_test_files(repo_path)
-    test_files, test_funcs = [], []
-    for f in all_files:
+
+    repo_path = os.path.join(repo_root, wrap_repo(repo_id))
+    extracted_here = False  # Track if we extracted the repo here
+
+    # If repo doesn't exist and auto_download is enabled, download and extract it
+    if not os.path.exists(repo_path) or not os.path.isdir(repo_path):
+        if not auto_download:
+            return 1, 0, 0
+
+        # Check if tarball exists
+        tarball_root = os.path.join(os.path.dirname(repo_root), "repos_tarball")
+        tarball_path = os.path.join(tarball_root, wrap_repo(repo_id) + ".tar.gz")
+
+        if not os.path.exists(tarball_path):
+            # Download the repo
+            try:
+                # Get access token if available
+                oauth_token = get_access_token()
+                hub = Github(auth=Auth.Token(oauth_token)) if oauth_token else Github()
+
+                # Ensure tarball directory exists
+                os.makedirs(tarball_root, exist_ok=True)
+
+                # Download repo
+                status, result = download_repo(
+                    hub=hub,
+                    repo_id=repo_id,
+                    path=tarball_path,
+                    fetch_timeout=30,
+                    download_timeout=300,
+                )
+
+                if status != 0:
+                    return 4, 0, 0  # Download failed
+
+            except Exception as e:
+                print(f"Download failed for {repo_id}: {e}")
+                return 4, 0, 0
+
+        # Extract the tarball
         try:
-            funcs = collect_test_funcs(f)
-        except TimeoutException:
-            raise
-        except:  # pylint: disable=bare-except
-            funcs = None
-        if funcs is None or len(funcs) == 0:
-            continue
-        test_files.append(f)
-        test_funcs.extend(funcs)
-    if len(test_funcs) == 0:
-        return 2, len(test_files), len(test_funcs)
-    # save to disk
-    with open(test_path, "w") as outfile:
-        for func_id in test_funcs:
-            parts = func_id.split("::")
-            parts[0] = str(
-                Path(os.path.abspath(parts[0])).relative_to(os.path.abspath(repo_root))
-            )
-            func_id = "::".join(parts)
-            outfile.write(f"{func_id}\n")
-    return 0, len(test_files), len(test_funcs)
+            # Ensure repo directory exists
+            os.makedirs(repo_root, exist_ok=True)
+
+            with tarfile.open(tarball_path, "r:gz") as tar:
+                # Extract to a temporary location first
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Use data filter for safer extraction (Python 3.12+)
+                    try:
+                        tar.extractall(temp_dir, filter="data")
+                    except TypeError:
+                        # Fallback for older Python versions
+                        tar.extractall(temp_dir)
+
+                    # Find the extracted directory (usually has a different name)
+                    extracted_dirs = [
+                        d
+                        for d in os.listdir(temp_dir)
+                        if os.path.isdir(os.path.join(temp_dir, d))
+                    ]
+
+                    if extracted_dirs:
+                        # Move the extracted directory to the correct location
+                        source_path = os.path.join(temp_dir, extracted_dirs[0])
+                        shutil.move(source_path, repo_path)
+                        extracted_here = True
+                    else:
+                        return 5, 0, 0  # Extract failed
+
+        except Exception as e:
+            print(f"Extract failed for {repo_id}: {e}")
+            return 5, 0, 0
+
+    try:
+        # collect potential testing modules
+        all_files = collect_test_files(repo_path)
+        test_files, test_funcs = [], []
+        for f in all_files:
+            try:
+                funcs = collect_test_funcs(f)
+            except TimeoutException:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                funcs = None
+            if funcs is None or len(funcs) == 0:
+                continue
+            test_files.append(f)
+            test_funcs.extend(funcs)
+
+        if len(test_funcs) == 0:
+            result = 2, len(test_files), len(test_funcs)
+        else:
+            # save to disk
+            os.makedirs(test_root, exist_ok=True)
+            with open(test_path, "w") as outfile:
+                for func_id in test_funcs:
+                    parts = func_id.split("::")
+                    parts[0] = str(
+                        Path(os.path.abspath(parts[0])).relative_to(
+                            os.path.abspath(repo_root)
+                        )
+                    )
+                    func_id = "::".join(parts)
+                    outfile.write(f"{func_id}\n")
+            result = 0, len(test_files), len(test_funcs)
+
+    finally:
+        # Clean up: remove extracted repo if we extracted it here
+        if extracted_here and os.path.exists(repo_path):
+            try:
+                shutil.rmtree(repo_path)
+            except Exception as e:
+                print(f"Warning: Failed to cleanup {repo_path}: {e}")
+
+    return result
 
 
 def main(
@@ -166,11 +268,12 @@ def main(
     timeout: int = 120,
     nprocs: int = 0,
     limits: int = -1,
+    auto_download: bool = True,
 ):
     # if repo_id_list is a file then load lines
     # otherwise it is the id of a specific repo
     try:
-        repo_id_list = [l.strip() for l in open(repo_id, "r").readlines()]
+        repo_id_list = [line.strip() for line in open(repo_id, "r").readlines()]
     except FileNotFoundError:
         repo_id_list = [repo_id]
     if limits > 0:
@@ -184,6 +287,7 @@ def main(
         repo_root=repo_root,
         test_root=test_root,
         timeout=timeout,
+        auto_download=auto_download,
     )
 
     filtered_results = [i for i in status_nfile_ntest if i is not None]
@@ -192,7 +296,9 @@ def main(
     status, nfile, ntest = zip(*filtered_results)
     status_counter: Counter[int] = Counter(status)
     print(
-        f"Processed {sum(status.values())} repos with {status[3]} skipped, {status[1]} not found, and {status[2]} failed to mine any testing functions"
+        f"Processed {sum(status_counter.values())} repos with {status_counter[3]} skipped, "
+        f"{status_counter[1]} not found, {status_counter.get(4, 0)} download failed, "
+        f"{status_counter.get(5, 0)} extract failed, and {status_counter[2]} failed to mine any testing functions"
     )
     print(f"Collected {sum(ntest)} tests from {sum(nfile)} files in total")
 

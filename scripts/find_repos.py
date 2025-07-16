@@ -9,12 +9,16 @@ https://docs.github.com/en/search-github/github-code-search/understanding-github
 For path querying specifically:
 https://docs.github.com/en/search-github/github-code-search/understanding-github-code-search-syntax#path-qualifier
 """
+
 from collections import OrderedDict
 import datetime
 import fire
 import os
 import sys
 from typing import Callable, Optional
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.check_repo_stats import check_requirements, check_map
 from scripts.common import get_graphql_data
@@ -41,7 +45,9 @@ def search_by_last_push(
 ) -> dict:
     """Returns result from searching by last push date"""
     # pushed_date is used to specify the upper range of the dates
-    search_query: str = f"language:{language} stars:{stars_query} pushed:2020-01-01..{pushed_date} archived:false"
+    search_query: str = (
+        f"language:{language} stars:{stars_query} pushed:2020-01-01..{pushed_date} archived:false"
+    )
     repos: dict = get_graphql_data(gql_format % (search_query, bulk_size, cursor))
     # If search result repositoryCount < 1000, parse the 1000 and move on to next star count
     while True:
@@ -260,4 +266,3 @@ def main(
 
 if __name__ == "__main__":
     fire.Fire(main)
-

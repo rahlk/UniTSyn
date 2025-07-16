@@ -130,7 +130,7 @@ def main(
         pbar.set_description(
             f"Downloading {repo_id}, Rate: {rate.core.remaining}/{rate.core.limit}"
         )
-        # download repo
+        # download repo0
         path = os.path.join(oroot, wrap_repo(repo_id)) + ".tar.gz"
         status, results = download_repo(
             hub, repo_id, path, fetch_timeout, download_timeout
